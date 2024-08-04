@@ -1,11 +1,12 @@
-from ultralytics import YOLO
+import os
 import torch
 import torch.quantization
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.utils.ops import scale_image
-from PIL import Image
-import numpy as np
-import os
+from multiprocessing import Pool, cpu_count
 
 # Load your dataset
 data = check_det_dataset('/media/parashuram/dataset/YOLOv8_/datasets//data.yaml')
@@ -27,19 +28,7 @@ model.model.qconfig = qconfig
 # Prepare the model for static quantization
 torch.quantization.prepare(model.model, inplace=True)
 
-# Calibrate the model
-def calibrate(model, dataset):
-    for path in dataset:
-        if os.path.isdir(path):
-            for root, _, files in os.walk(path):
-                for file in files:
-                    if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        img_path = os.path.join(root, file)
-                        process_image(model, img_path)
-        else:
-            process_image(model, path)
-
-def process_image(model, img_path):
+def process_image(img_path):
     img = Image.open(img_path).convert('RGB')
     img = np.array(img)
     
@@ -53,20 +42,50 @@ def process_image(model, img_path):
     if img.ndimension() == 3:
         img = img.unsqueeze(0)
     
+    return img
+
+def calibrate_worker(img_path):
+    img = process_image(img_path)
     model.model(img)
 
+# Calibrate the model using multiprocessing
+def calibrate(model, dataset):
+    image_paths = []
+    for path in dataset:
+        if os.path.isdir(path):
+            for root, _, files in os.walk(path):
+                for file in files:
+                    if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        image_paths.append(os.path.join(root, file))
+        else:
+            image_paths.append(path)
+    
+    num_cores = cpu_count()
+    with Pool(num_cores) as p:
+        p.map(calibrate_worker, image_paths)
+
+print("Starting calibration...")
 calibrate(model, calibration_dataset)
+print("Calibration completed.")
 
 # Convert the model to quantized version
+print("Converting model to quantized version...")
 torch.quantization.convert(model.model, inplace=True)
 
 # Save the quantized model
+print("Saving quantized model...")
 torch.save(model.state_dict(), 'yolov8_quantized.pt')
 
+# Move the model to GPU for validation
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
 # Evaluate the quantized model
+print("Evaluating quantized model...")
 results = model.val(data=data['val'])  # Validate on the validation set
 
 # Print accuracy metrics
-print(results.box.map)    # Mean Average Precision (mAP)
-print(results.box.map50)  # mAP at IoU 0.5
-print(results.box.map75)  # mAP at IoU 0.75
+print("Accuracy metrics:")
+print(f"mAP: {results.box.map:.4f}")
+print(f"mAP50: {results.box.map50:.4f}")
+print(f"mAP75: {results.box.map75:.4f}")
